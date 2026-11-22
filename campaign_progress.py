@@ -99,6 +99,14 @@ def _unsigned_integer(value: str, label: str) -> int:
     return result
 
 
+def next_save_id_for(last_save_id: str | int) -> int:
+    """Return the next save counter for an edited LastSavedGame ID."""
+    save_id = _unsigned_integer(str(last_save_id), "Last Save ID")
+    if save_id >= 2147483647:
+        raise ValueError("Last Save ID is too large to calculate SaveRunningID (ID + 1).")
+    return save_id + 1
+
+
 def _completed_levels(text: str) -> tuple[str, ...]:
     if not text:
         return ()
@@ -145,7 +153,7 @@ def apply_campaign_values(
 ) -> list[str]:
     """Update existing attributes after *all* inputs have passed validation."""
     nodes = _nodes(root)
-    for name in ((_SAVE_FIELD, _NEXT_ID_FIELD) if next_save_id is not None else (_SAVE_FIELD,)):
+    for name in (_SAVE_FIELD, _NEXT_ID_FIELD):
         if name not in nodes or nodes[name].get("value") is None:
             raise ValueError(f"The target profile is missing required field: {name}")
     parsed = split_save_filename(last_save_file.strip())
@@ -153,7 +161,7 @@ def apply_campaign_values(
         raise ValueError("Last Save File must have the form 81_Cave_1288.CSF.")
     save_id = _unsigned_integer(str(last_save_id), "Last Save ID")
     next_id = (_unsigned_integer(str(next_save_id), "Next Save ID")
-               if next_save_id is not None else None)
+               if next_save_id is not None else next_save_id_for(save_id))
     level_id = current_level_id.strip()
     if parsed[0] != save_id or parsed[1].casefold() != level_id.casefold():
         raise ValueError("Last Save ID and Current Level ID must match the Last Save File name.")
@@ -162,9 +170,10 @@ def apply_campaign_values(
     difficulty_num = _unsigned_integer(str(difficulty), "Difficulty")
     if not 1 <= difficulty_num <= 5:
         raise ValueError("Difficulty must be between 1 and 5.")
-    changes = {_SAVE_FIELD: last_save_file.strip()}
-    if next_id is not None:
-        changes[_NEXT_ID_FIELD] = str(next_id)
+    changes = {
+        _SAVE_FIELD: last_save_file.strip(),
+        _NEXT_ID_FIELD: str(next_id),
+    }
     for name in _DIFFICULTY_FIELDS:
         if name in nodes:
             changes[name] = str(difficulty_num)

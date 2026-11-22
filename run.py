@@ -3,10 +3,14 @@ from pathlib import Path
 import os
 import sys
 import traceback
+import faulthandler
 from datetime import datetime
 
-if os.name == "nt" and not sys.executable.lower().endswith("pythonw.exe"):
-    candidate = Path(sys.executable).with_name("pythonw.exe")
+if os.name == "nt" and not Path(sys.executable).name.casefold().startswith("pythonw"):
+    name = Path(sys.executable).name
+    candidate = Path(sys.executable).with_name(
+        "pythonw" + name[len("python"):] if name.casefold().startswith("python") else "pythonw.exe"
+    )
     if candidate.is_file():
         import subprocess
         subprocess.Popen([str(candidate), str(Path(__file__).resolve()), *sys.argv[1:]],
@@ -14,6 +18,13 @@ if os.name == "nt" and not sys.executable.lower().endswith("pythonw.exe"):
         sys.exit(0)
 
 BASE = Path(__file__).resolve().parent
+_crash_stream = None
+try:
+    (BASE / "logs").mkdir(parents=True, exist_ok=True)
+    _crash_stream = (BASE / "logs" / "crash_trace.log").open("a", encoding="utf-8", buffering=1)
+    faulthandler.enable(file=_crash_stream, all_threads=True)
+except (OSError, RuntimeError):
+    pass
 os.chdir(BASE)
 sys.path.insert(0, str(BASE))
 try:

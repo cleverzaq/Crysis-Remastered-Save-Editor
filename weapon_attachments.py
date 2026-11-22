@@ -36,8 +36,6 @@ class Attachment:
     profile_key: Optional[str] = None
 
 
-# Guide location order / 20-count from GRYOnline.pl (Aug 2019).
-# Internal keys are cross-checked against the supplied 100% Crysis 3 profile.
 ATTACHMENTS = (
     Attachment(1, 'Iron Sights', 'Hammer II', 'Post-Human',
                'Granted automatically near the beginning of the campaign.', 'ironsight'),

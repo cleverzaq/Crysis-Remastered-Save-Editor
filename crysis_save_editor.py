@@ -18,9 +18,16 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-from crysis_remastered_decrypt import extract_cipher, save_key_backup, KEY_BACKUP_EXTENSION
+from crysis_remastered_decrypt import (
+    extract_cipher, save_key_backup, KEY_BACKUP_EXTENSION,
+    CRYSIS1_MAGIC, CRYSIS2_MAGIC, CRYSIS3_MAGIC,
+)
 from game_profiles import GAME_PROFILES, identify_game, profile_fields, validate_value, locate_profile
 from xml_tree_search import find_xml_nodes
+from windows_drop import (
+    WindowsDropTarget, create_drop_zone, install_tkdnd_for_runtime,
+    runtime_console_python,
+)
 from savegame_paths import (
     resolve_savegame_dir, find_save_file, is_profile_directory, game_from_path,
     profile_name_from_path, save_file_candidates, classify_save_filename,
@@ -29,6 +36,7 @@ from crysis3_gui import Crysis3ProgressMixin
 from editor_safety import document_is_dirty, export_slot_backup
 from campaign_progress import (
     LEVEL_IDS, read_campaign_progress, apply_campaign_values, restore_campaign_values,
+    next_save_id_for,
     split_save_filename, format_save_filename, load_exported_profile,
 )
 from save_editor_core import (
@@ -116,10 +124,10 @@ class CrysisSaveEditor(Crysis3ProgressMixin):
         self.player_editor_rows: dict[str, tuple[ET.Element, str]] = {}
         self._quick_search_window: tk.Toplevel | None = None
         self._quick_search_results: dict[str, dict] = {}
-        self._drop_hwnds: list[ctypes.c_void_p] = []
-        self._drop_original_procs: dict[int, ctypes.c_void_p] = {}
-        self._drop_call_window_proc = None
-        self._drop_callback = None
+        self._drop_target = None
+        self._drop_install_in_progress = False
+        self._dnd_install_results = queue.Queue()
+        self._campaign_next_id_manual = False
 
         self._restore_last_paths()
         self._build_menu()
@@ -615,6 +623,18 @@ class CrysisSaveEditor(Crysis3ProgressMixin):
         self._build_batch_tab()
         self._build_sidebar()
 
+        drop_strip = ttk.Frame(self.root, padding=(14, 0, 14, 4))
+        drop_strip.pack(fill="x")
+        self.drop_zone = create_drop_zone(
+            drop_strip, text="Drag encrypted CSF / attributes.xml / .meta here",
+            anchor="center", style="Muted.TLabel", padding=(10, 9),
+        )
+        self.drop_zone.pack(side="left", fill="x", expand=True)
+        self.dnd_install_button = ttk.Button(
+            drop_strip, text="Enable Drag & Drop", command=self._enable_drag_drop
+        )
+        self.dnd_install_button.pack(side="right", padx=(8, 0))
+
         status = ttk.Frame(self.root, padding=(16, 8))
         status.pack(fill="x")
         ttk.Label(status, textvariable=self.status_var, anchor="w", style="Muted.TLabel").pack(fill="x")
@@ -654,7 +674,7 @@ class CrysisSaveEditor(Crysis3ProgressMixin):
         ttk.Separator(self.sidebar).pack(fill="x", pady=12)
         ttk.Label(
             self.sidebar,
-            text="Drag a game EXE, encrypted save, or save folder into this window.",
+            text="Drop a game EXE, .crysiskey, encrypted profile, .CSF, .meta, or save folder here.",
             style="Muted.TLabel", wraplength=198, justify="left",
         ).pack(anchor="w")
 
@@ -1459,7 +1479,7 @@ class CrysisSaveEditor(Crysis3ProgressMixin):
         self.campaign_frame = frame
         self.campaign_vars = {
             key: tk.StringVar(value="") for key in (
-                "last_completed", "current_mission", "level", "last_id", "filename", "difficulty",
+                "last_completed", "current_mission", "level", "last_id", "next_id", "filename", "difficulty",
             )
         }
         fields = (
@@ -1468,6 +1488,7 @@ class CrysisSaveEditor(Crysis3ProgressMixin):
             ("Current Level ID", "level", 1, 0, False),
             ("Last Save ID", "last_id", 1, 1, False),
             ("Difficulty", "difficulty", 2, 0, False),
+            ("Next Save ID (SaveRunningID)", "next_id", 2, 1, False),
         )
         for col in range(2):
             frame.columnconfigure(col, weight=1)
@@ -1479,6 +1500,11 @@ class CrysisSaveEditor(Crysis3ProgressMixin):
                 ttk.Label(container, textvariable=self.campaign_vars[key], font=("Segoe UI Semibold", 10)).pack(anchor="w", pady=(4, 1))
             elif key == "level":
                 ttk.Combobox(container, textvariable=self.campaign_vars[key], values=(*LEVEL_IDS, "River"), width=25).pack(fill="x", pady=(4, 0))
+            elif key == "next_id":
+                next_controls = ttk.Frame(container)
+                next_controls.pack(fill="x", pady=(4, 0))
+                ttk.Entry(next_controls, textvariable=self.campaign_vars[key]).pack(side="left", fill="x", expand=True)
+                ttk.Button(next_controls, text="Last + 1", command=self._auto_campaign_next_id).pack(side="left", padx=(8, 0))
             else:
                 ttk.Entry(container, textvariable=self.campaign_vars[key]).pack(fill="x", pady=(4, 0))
         ttk.Label(frame, text="Last Save File", style="Muted.TLabel").grid(row=3, column=0, columnspan=2, sticky="w")
@@ -1499,13 +1525,37 @@ class CrysisSaveEditor(Crysis3ProgressMixin):
         self.campaign_vars["filename"].trace_add("write", self._campaign_filename_changed)
         self.campaign_vars["last_id"].trace_add("write", self._campaign_parts_changed)
         self.campaign_vars["level"].trace_add("write", self._campaign_parts_changed)
+        self.campaign_vars["next_id"].trace_add("write", self._campaign_next_id_changed)
         frame.pack(fill="x", pady=(0, 8))
+
+    def _campaign_next_id_changed(self, *_):
+        if not self._campaign_updating:
+            self._campaign_next_id_manual = True
+
+    def _auto_campaign_next_id(self):
+        """Opt back into ID + 1 after a manual SaveRunningID override."""
+        self._campaign_next_id_manual = False
+        self._sync_campaign_next_id()
+
+    def _sync_campaign_next_id(self):
+        if self._campaign_next_id_manual:
+            return
+        self._campaign_updating = True
+        try:
+            try:
+                value = str(next_save_id_for(self.campaign_vars["last_id"].get()))
+            except ValueError:
+                value = ""
+            self.campaign_vars["next_id"].set(value)
+        finally:
+            self._campaign_updating = False
 
     def _campaign_filename_changed(self, *_):
         if self._campaign_updating:
             return
         parsed = split_save_filename(self.campaign_vars["filename"].get().strip())
         if parsed is None:
+            self._sync_campaign_next_id()
             return
         self._campaign_updating = True
         try:
@@ -1513,10 +1563,12 @@ class CrysisSaveEditor(Crysis3ProgressMixin):
             self.campaign_vars["level"].set(parsed[1])
         finally:
             self._campaign_updating = False
+        self._sync_campaign_next_id()
 
     def _campaign_parts_changed(self, *_):
         if self._campaign_updating:
             return
+        self._sync_campaign_next_id()
         parsed = split_save_filename(self.campaign_vars["filename"].get().strip())
         if parsed is None:
             return
@@ -1562,6 +1614,7 @@ class CrysisSaveEditor(Crysis3ProgressMixin):
             "current_mission": snapshot.current_mission,
             "level": snapshot.current_level_id,
             "last_id": "" if snapshot.last_save_id is None else str(snapshot.last_save_id),
+            "next_id": "" if snapshot.next_save_id is None else str(snapshot.next_save_id),
             "filename": snapshot.last_save_file,
             "difficulty": snapshot.difficulty,
         }
@@ -1569,12 +1622,14 @@ class CrysisSaveEditor(Crysis3ProgressMixin):
         try:
             for key, value in values.items():
                 self.campaign_vars[key].set(value)
+            self._campaign_next_id_manual = False
         finally:
             self._campaign_updating = False
         save_folder = resolve_savegame_dir(doc.path, self.slot_folder_var.get().strip(), self.profile_game)
         path_note = f".CSF folder: {save_folder}" if save_folder else ".CSF folder not detected; use SaveGames Folder…"
         self.campaign_hint.set(
             "Last Completed Mission is inferred from campaign progress (not a timestamp). "
+            "Next Save ID is editable. Last + 1 restores automatic numbering. "
             f"Changes stay in memory until Save Encrypted Profile. {path_note}"
         )
 
@@ -1584,6 +1639,7 @@ class CrysisSaveEditor(Crysis3ProgressMixin):
             last_save_id=self.campaign_vars["last_id"].get(),
             current_level_id=self.campaign_vars["level"].get(),
             difficulty=self.campaign_vars["difficulty"].get(),
+            next_save_id=self.campaign_vars["next_id"].get(),
         )
 
     def _campaign_has_pending_inputs(self):
@@ -1594,7 +1650,30 @@ class CrysisSaveEditor(Crysis3ProgressMixin):
             fields["last_save_id"] != (str(current.last_save_id) if current.last_save_id is not None else ""),
             fields["current_level_id"] != current.current_level_id,
             fields["difficulty"] != current.difficulty,
+            fields["next_save_id"] != (str(current.next_save_id) if current.next_save_id is not None else ""),
         ))
+
+    def _confirm_campaign_counter_rewind(self, staged_root):
+        current = read_campaign_progress(self.profile_document.root)
+        proposed = read_campaign_progress(staged_root)
+        old_id, new_id = current.next_save_id, proposed.next_save_id
+        last_id = proposed.last_save_id
+        if new_id is None:
+            return False
+        warnings = []
+        if old_id is not None and new_id < old_id:
+            warnings.append(f"SaveRunningID will decrease from {old_id} to {new_id}.")
+        if last_id is not None and new_id <= last_id:
+            warnings.append(f"Next Save ID {new_id} is not greater than Last Save ID {last_id}.")
+        if warnings:
+            return messagebox.askyesno(
+                "Potential Save Slot ID Collision",
+                "\n".join(warnings)
+                + "\n\nThis may reuse an existing .CSF ID and overwrite a newer save. "
+                  "Back up SaveGames and verify the intended next ID first.\n\nContinue?",
+                icon="warning",
+            )
+        return True
 
     def _apply_campaign_panel(self):
         doc = self.profile_document
@@ -1602,6 +1681,10 @@ class CrysisSaveEditor(Crysis3ProgressMixin):
             messagebox.showinfo("Campaign Progress", "Open a Crysis 3 Remastered profile first.")
             return
         try:
+            staged = copy.deepcopy(doc.root)
+            apply_campaign_values(staged, **self._campaign_inputs())
+            if not self._confirm_campaign_counter_rewind(staged):
+                return
             changed = apply_campaign_values(doc.root, **self._campaign_inputs())
         except ValueError as exc:
             messagebox.showerror("Invalid Campaign Values", str(exc))
@@ -1902,6 +1985,10 @@ class CrysisSaveEditor(Crysis3ProgressMixin):
             try:
                 # Do not silently discard edits still typed into the Campaign panel.
                 if self._campaign_has_pending_inputs():
+                    staged = copy.deepcopy(doc.root)
+                    apply_campaign_values(staged, **self._campaign_inputs())
+                    if not self._confirm_campaign_counter_rewind(staged):
+                        return
                     apply_campaign_values(doc.root, **self._campaign_inputs())
             except ValueError as exc:
                 messagebox.showerror("Invalid Campaign Values", str(exc))
@@ -2105,7 +2192,7 @@ class CrysisSaveEditor(Crysis3ProgressMixin):
         path = filedialog.askopenfilename(
             title="Select the game EXE that matches the save files",
             initialdir=str(initial_dir) if initial_dir else None,
-            filetypes=(("Executable File", "*.exe"), ("All Files", "*.*")),
+            filetypes=(("Game executable / key", "*.exe *.crysiskey"), ("All Files", "*.*")),
         )
         if path:
             self._select_exe_path(path)
@@ -2882,149 +2969,220 @@ class CrysisSaveEditor(Crysis3ProgressMixin):
         self.tabs.select(self.tree_tab)
         self._reveal_element(element)
 
+    @staticmethod
+    def _running_elevated_on_windows():
+        if os.name != "nt":
+            return False
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except (AttributeError, OSError):
+            return False
+
+    def _on_drop_activity(self, action):
+        if action == "enter":
+            self.drop_zone.configure(text="Release the file to open it")
+        elif action == "received":
+            self.status_var.set("File drop received. Opening...")
+        elif action == "error":
+            self.status_var.set("Drop error. See logs/editor.log.")
+        else:
+            self.drop_zone.configure(text="Drag encrypted CSF / attributes.xml / .meta here")
+
     def _install_windows_drop_target(self):
-        """Install native WM_DROPFILES support on the main window and its child controls."""
-        if sys.platform != "win32":
-            return
         try:
-            user32 = ctypes.windll.user32
-            shell32 = ctypes.windll.shell32
-            wndproc_type = ctypes.WINFUNCTYPE(
-                ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t
+            target = WindowsDropTarget(
+                self.root, self._handle_dropped_paths, widgets=(self.drop_zone,),
+                on_activity=self._on_drop_activity, register_content=True,
             )
-            set_window_proc = user32.SetWindowLongPtrW
-            set_window_proc.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
-            set_window_proc.restype = ctypes.c_void_p
-            call_window_proc = user32.CallWindowProcW
-            call_window_proc.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
-            call_window_proc.restype = ctypes.c_ssize_t
-            self._drop_call_window_proc = call_window_proc
-            self._drop_callback = wndproc_type(self._drop_wndproc)
-
-            # Windows sends WM_DROPFILES to the child window under the cursor.
-            # Register each Tk child so dropping onto a tree/table also works.
-            widgets = []
-            pending = [self.root]
-            while pending:
-                widget = pending.pop()
-                widgets.append(widget)
-                try:
-                    pending.extend(widget.winfo_children())
-                except tk.TclError:
-                    pass
-
-            for widget in widgets:
-                try:
-                    hwnd_value = widget.winfo_id()
-                    hwnd = ctypes.c_void_p(hwnd_value)
-                    old_proc = set_window_proc(hwnd, -4, ctypes.cast(self._drop_callback, ctypes.c_void_p))
-                    if old_proc:
-                        self._drop_original_procs[int(hwnd_value)] = old_proc
-                        self._drop_hwnds.append(hwnd)
-                        shell32.DragAcceptFiles(hwnd, True)
-                except Exception:
-                    continue
-
-            if not self._drop_hwnds:
-                raise OSError("No application windows accepted drag and drop.")
-            self.status_var.set("Drag and drop is enabled. Drop a game EXE, encrypted save, or save folder into the window.")
+            registered = target.install()
+            self._drop_target = target
+            self.dnd_install_button.configure(text="Drag & Drop: ON", state="disabled")
+            self.drop_zone.configure(text="Drag encrypted CSF / attributes.xml / .meta here")
+            if self._running_elevated_on_windows():
+                self.status_var.set(
+                    "Drag & Drop enabled, but Windows may block drops from Explorer "
+                    "while this editor runs as Administrator. Restart normally."
+                )
+            else:
+                self.status_var.set(f"Drag & Drop enabled (TkDND; {registered} drop surfaces).")
         except Exception as exc:
-            self.status_var.set(f"Native drag and drop could not be enabled: {exc}")
-
-    def _drop_wndproc(self, hwnd, message, wparam, lparam):
-        if message == 0x0233:  # WM_DROPFILES
-            paths = []
-            drop_handle = ctypes.c_void_p(wparam)
+            self._drop_target = None
+            self._drop_load_error = str(exc)
+            self.status_var.set(f"Drag & Drop OFF: {exc}")
+            self.drop_zone.configure(text="Drag & Drop OFF — click Enable Drag & Drop →")
+            self.dnd_install_button.configure(text="Enable Drag & Drop", state="normal")
             try:
-                shell32 = ctypes.windll.shell32
-                shell32.DragQueryFileW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_uint]
-                shell32.DragQueryFileW.restype = ctypes.c_uint
-                shell32.DragFinish.argtypes = [ctypes.c_void_p]
-                total = shell32.DragQueryFileW(drop_handle, 0xFFFFFFFF, None, 0)
-                for index in range(total):
-                    buffer = ctypes.create_unicode_buffer(32768)
-                    shell32.DragQueryFileW(drop_handle, index, buffer, len(buffer))
-                    if buffer.value:
-                        paths.append(buffer.value)
-            finally:
+                with (Path(__file__).resolve().parent / "logs" / "editor.log").open("a", encoding="utf-8") as log:
+                    log.write(f"\nDrag & Drop initialization: {exc}\nRuntime: {runtime_console_python()}\n")
+            except OSError:
+                pass
+
+    def _enable_drag_drop(self):
+        if self._drop_install_in_progress or self._drop_target is not None:
+            return
+        if not messagebox.askyesno(
+            "Enable Drag & Drop",
+            "Install / repair tkinterdnd2 for the Python running this editor?\n\n"
+            f"Python: {runtime_console_python()}\n\n"
+            "An internet connection is required. Restart the editor after installation.",
+        ):
+            return
+        self._drop_install_in_progress = True
+        self.dnd_install_button.configure(state="disabled", text="Installing...")
+        self.status_var.set("Installing tkinterdnd2 for the running Python interpreter...")
+        threading.Thread(target=self._install_drag_drop_worker, daemon=True).start()
+        self.root.after(200, self._poll_drag_drop_install)
+
+    def _install_drag_drop_worker(self):
+        succeeded, diagnostic = install_tkdnd_for_runtime()
+        try:
+            log_path = Path(__file__).resolve().parent / "logs" / "editor.log"
+            log_path.parent.mkdir(exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as log:
+                log.write("\n=== Drag & Drop installation ===\n" + diagnostic + "\n")
+        except OSError:
+            pass
+        self._dnd_install_results.put(succeeded)
+
+    def _poll_drag_drop_install(self):
+        try:
+            succeeded = self._dnd_install_results.get_nowait()
+        except queue.Empty:
+            self.root.after(200, self._poll_drag_drop_install)
+            return
+        self._finish_drag_drop_install(succeeded)
+
+    def _finish_drag_drop_install(self, succeeded):
+        self._drop_install_in_progress = False
+        self.dnd_install_button.configure(state="normal", text="Enable Drag & Drop")
+        if succeeded:
+            self.status_var.set("TkDND installed. Close and reopen the editor to activate Drag & Drop.")
+            self.drop_zone.configure(text="TkDND installed — restart the editor to enable drops")
+            messagebox.showinfo(
+                "Drag & Drop Installed",
+                "TkDND was installed into the running Python environment.\n"
+                "Close and reopen Crysis Save Editor to enable Drag & Drop.",
+            )
+        else:
+            self.status_var.set("TkDND installation failed; see logs/editor.log.")
+            messagebox.showerror(
+                "Drag & Drop Installation Failed",
+                "The installation did not succeed. Check logs/editor.log for the pip error.\n"
+                f"Interpreter: {runtime_console_python()}",
+            )
+
+    def _select_key_for_dropped_save(self, path: Path) -> bool:
+        """Match the encrypted file header to the bundled game key, if needed."""
+        try:
+            with path.open("rb") as stream:
+                signature = stream.read(7)
+        except OSError as exc:
+            messagebox.showerror("File Drop Error", f"Cannot read {path.name}: {exc}")
+            return False
+        matching_game = {
+            CRYSIS1_MAGIC: "CrysisRemastered",
+            CRYSIS2_MAGIC: "Crysis2Remastered",
+            CRYSIS3_MAGIC: "Crysis3Remastered",
+        }.get(signature)
+        if matching_game is None:
+            messagebox.showerror(
+                "Unsupported File",
+                f"{path.name} is not a recognized encrypted Crysis save. "
+                "For decrypted XML, use Import XML instead.",
+            )
+            return False
+        if self.exe_path is not None:
+            try:
+                current_magic, _ = extract_cipher(self.exe_path)
+                if current_magic == signature:
+                    return True
+            except Exception:
+                pass
+        bundled_key = Path(__file__).resolve().parent / "keys" / f"{matching_game}.crysiskey"
+        if bundled_key.is_file():
+            self._select_exe_path(bundled_key)
+            if self.exe_path is not None:
                 try:
-                    shell32.DragFinish(drop_handle)
+                    selected_magic, _ = extract_cipher(self.exe_path)
+                    if selected_magic == signature:
+                        return True
                 except Exception:
                     pass
-            if paths:
-                try:
-                    self.root.after(0, lambda dropped=tuple(paths): self._handle_dropped_paths(dropped))
-                except tk.TclError:
-                    pass
-            return 0
+        if self.exe_path is None:
+            messagebox.showinfo(
+                "Select Game Key",
+                f"Select an EXE or .crysiskey for {matching_game} to open {path.name}.",
+            )
+            self.choose_exe()
+        if self.exe_path is None:
+            return False
         try:
-            old_proc = self._drop_original_procs.get(int(hwnd))
-            if old_proc and self._drop_call_window_proc:
-                return self._drop_call_window_proc(old_proc, hwnd, message, wparam, lparam)
+            selected_magic, _ = extract_cipher(self.exe_path)
+            return selected_magic == signature
         except Exception:
-            pass
-        return 0
+            return False
 
     def _handle_dropped_paths(self, dropped_paths):
-        paths = [Path(item).expanduser() for item in dropped_paths]
-        exe_paths = [item for item in paths if item.is_file() and item.suffix.casefold() == ".exe"]
-        folders = [item for item in paths if item.is_dir()]
-        save_paths = [
-            item for item in paths
-            if item.is_file() and item.suffix.casefold() in (".csf", ".meta", ".xml")
-            and ".bak" not in item.name.casefold()
-        ]
-
-        if exe_paths:
-            self._select_exe_path(exe_paths[0])
-        if folders:
-            self.slot_folder_var.set(str(folders[0].resolve()))
-            self._save_settings()
-            self.refresh_slot_list()
-            self.tabs.select(self.slot_tab)
-        if save_paths:
-            save_path = save_paths[0]
-            if self.exe_path is None:
-                self.status_var.set("A save file was dropped. Select the matching game EXE before opening it.")
-                return
-            if not self.slot_folder_var.get().strip():
-                self.slot_folder_var.set(str(save_path.parent))
+        """Route file drops through normal protected open commands on Tk's event loop."""
+        try:
+            paths = [Path(item).expanduser() for item in dropped_paths]
+            exe_paths = [p for p in paths if p.is_file() and p.suffix.casefold() in (".exe", ".crysiskey")]
+            folders = [p for p in paths if p.is_dir()]
+            saves = [
+                p for p in paths if p.is_file() and p.suffix.casefold() in (".csf", ".meta", ".xml")
+                and ".bak" not in p.name.casefold()
+            ]
+            if exe_paths:
+                self._select_exe_path(exe_paths[0])
+            if folders:
+                self.slot_folder_var.set(str(folders[0].resolve()))
                 self._save_settings()
-            if save_path.name.casefold() in ("attributes_pc.xml", "attributes.xml"):
-                self.open_profile(save_path)
+                self.refresh_slot_list()
+                self.tabs.select(self.slot_tab)
+            if saves:
+                # Prefer a playable save to its sidecar .meta if both are dropped.
+                saves.sort(key=lambda p: (0 if p.name.casefold().startswith("attributes") and p.suffix.casefold() == ".xml"
+                                          else 1 if p.suffix.casefold() == ".csf"
+                                          else 2 if p.suffix.casefold() == ".xml" else 3))
+                save_path = saves[0]
+                if save_path.suffix.casefold() == ".meta":
+                    # A .meta is a sidecar, not an encrypted save container.
+                    companion = save_path.with_suffix(".CSF")
+                    if not companion.is_file():
+                        companion = save_path.with_suffix(".csf")
+                    if not companion.is_file():
+                        messagebox.showwarning(
+                            "Missing Save File",
+                            f"{save_path.name} is metadata only. Drop the corresponding .CSF file instead.",
+                        )
+                        return
+                    save_path = companion
+                if not self._select_key_for_dropped_save(save_path):
+                    return
+                if not self.slot_folder_var.get().strip():
+                    self.slot_folder_var.set(str(save_path.parent))
+                    self._save_settings()
+                if save_path.name.casefold() in ("attributes_pc.xml", "attributes.xml"):
+                    self.open_profile(save_path)
+                else:
+                    self.open_file(save_path)
+                if len(saves) > 1:
+                    self.status_var.set(f"Processed {save_path.name}; {len(saves) - 1} other dropped file(s) were not opened.")
+            elif exe_paths and not folders:
+                self.status_var.set(f"Game key selected: {exe_paths[0]}")
+            elif folders:
+                self.status_var.set(f"Save folder loaded: {folders[0]}")
             else:
-                self.open_file(save_path)
-            if len(save_paths) > 1:
-                self.status_var.set(f"Opened {save_path.name}. {len(save_paths) - 1} additional dropped save(s) are listed in the Save Slot Manager.")
-        elif exe_paths and not folders:
-            self.status_var.set(f"Game EXE selected: {exe_paths[0]}")
-        elif folders:
-            self.status_var.set(f"Save folder loaded: {folders[0]}")
-        elif not exe_paths:
-            self.status_var.set("No supported game EXE, encrypted save, or save folder was dropped.")
+                self.status_var.set("No supported game EXE, key, encrypted save, or save folder was dropped.")
+        except Exception as exc:
+            WindowsDropTarget._write_error()
+            messagebox.showerror("File Drop Error", f"Unable to handle the dropped file(s):\n{exc}")
 
     def _remove_windows_drop_target(self):
-        if sys.platform != "win32" or not self._drop_hwnds:
-            return
-        try:
-            user32 = ctypes.windll.user32
-            shell32 = ctypes.windll.shell32
-            set_window_proc = user32.SetWindowLongPtrW
-            set_window_proc.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
-            set_window_proc.restype = ctypes.c_void_p
-            for hwnd in reversed(self._drop_hwnds):
-                old_proc = self._drop_original_procs.get(int(hwnd.value))
-                try:
-                    shell32.DragAcceptFiles(hwnd, False)
-                    if old_proc:
-                        set_window_proc(hwnd, -4, old_proc)
-                except Exception:
-                    pass
-        finally:
-            self._drop_callback = None
-            self._drop_call_window_proc = None
-            self._drop_original_procs.clear()
-            self._drop_hwnds.clear()
+        target = self._drop_target
+        if target is not None:
+            target.close()
+            self._drop_target = None
 
     def _parent_map(self):
         return {child: node for node in self.document.root.iter() for child in list(node)}
@@ -3455,7 +3613,7 @@ class CrysisSaveEditor(Crysis3ProgressMixin):
     def show_about(self):
         messagebox.showinfo(
             "Crysis Save Editor",
-            f"Crysis Save Editor {APP_VERSION}\n\nSupports Crysis Remastered, Crysis 2 Remastered, and Crysis 3 Remastered.\n\nGlobal Quick Search: Ctrl+K. Drag and drop game EXEs, encrypted saves, or save folders onto the window.\n\nSaving overwrites the open encrypted file after creating a .bak backup.",
+            f"Crysis Save Editor {APP_VERSION}\n\nSupports Crysis Remastered, Crysis 2 Remastered, and Crysis 3 Remastered.\n\nGlobal Quick Search: Ctrl+K. Drag and drop uses TkDND; click Enable Drag & Drop if unavailable.\n\nSaving overwrites the open encrypted file after creating a .bak backup.",
         )
 
     def _on_close(self):
@@ -3477,7 +3635,18 @@ class CrysisSaveEditor(Crysis3ProgressMixin):
 
 
 def main():
-    root = tk.Tk()
+    try:
+        from tkinterdnd2 import TkinterDnD
+        root = TkinterDnD.Tk()
+    except (ImportError, tk.TclError, OSError, RuntimeError) as exc:
+        root = tk.Tk()
+        root._crysis_dnd_startup_error = f"{type(exc).__name__}: {exc}"
+        if not isinstance(exc, ImportError):
+            try:
+                with (Path(__file__).resolve().parent / "logs" / "editor.log").open("a", encoding="utf-8") as log:
+                    log.write(f"TkDND initialization skipped: {exc}\n")
+            except OSError:
+                pass
     CrysisSaveEditor(root)
     root.mainloop()
 
